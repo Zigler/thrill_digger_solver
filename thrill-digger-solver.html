@@ -1,0 +1,612 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Thrill Digger Solver (Best Move)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    .board { margin-top: 12px; display: inline-block; border: 1px solid #bbb; border-radius: 8px; padding: 8px; }
+    .grid { border-collapse: collapse; }
+    .grid td { padding: 2px; }
+    button.cell {
+      width: 38px; height: 38px;
+      border: 1px solid #aaa; border-radius: 6px;
+      cursor: pointer;
+      font-weight: 700;
+      user-select: none;
+    }
+    button.cell.safePick { outline: 3px solid #2a7; }
+    button.cell.risky { outline: 3px solid #d66; }
+    .small { font-size: 12px; color: #444; }
+    .panel { margin-top: 12px; padding: 10px; border: 1px solid #ddd; border-radius: 8px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .warn { color: #b00; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <h2>Thrill Digger Solver (browser-only)</h2>
+
+  <div class="row">
+    <label>
+      Difficulty:
+      <select id="difficulty">
+        <option value="beginner">Beginner (5×4, 4 bombs)</option>
+        <option value="intermediate">Intermediate (6×5, 4 bombs, 4 rupoors)</option>
+        <option value="expert">Expert (8×5, 8 bombs, 8 rupoors)</option>
+      </select>
+    </label>
+
+    <button id="newGame">New board</button>
+    <button id="solve">Solve / Update probabilities</button>
+    <button id="bestMove">Best move</button>
+    <button id="clearHighlights">Clear highlights</button>
+  </div>
+
+  <div class="panel small">
+    <div><b>How to use</b></div>
+    <ul>
+      <li>Click a cell to cycle its revealed contents:
+        <span class="mono">?</span> → <span class="mono">G</span> → <span class="mono">B</span> →
+        <span class="mono">R</span> → <span class="mono">S</span> → <span class="mono">★</span> →
+        <span class="mono">Ø</span> → <span class="mono">💣</span> → <span class="mono">?</span>
+      </li>
+      <li><span class="mono">G/B/R/S/★</span> are rupees (safe) and each implies a <i>range</i> of adjacent “bad spots”.</li>
+      <li><span class="mono">Ø</span> = Rupoor (bad spot, but not game over). <span class="mono">💣</span> = Bomb (bad spot, game over).</li>
+      <li><b>Solve</b> highlights all safest (green outline) and riskiest (red outline). Hover an unknown cell to see “bad chance”.</li>
+      <li><b>Best move</b> picks a single recommended click: lowest bad chance; ties broken by “info gain”.</li>
+    </ul>
+    <div class="small">
+      Clue mapping used: Green=0, Blue=1–2, Red=3–4, Silver=5–6, Gold=7–8 adjacent bad spots (bad = bombs+rupoors).
+    </div>
+  </div>
+
+  <div id="status" class="panel mono small"></div>
+  <div class="board" id="board"></div>
+
+  <script>
+    // --- Game configuration (common guides) ---
+    const DIFF = {
+      beginner:     { w: 5, h: 4, bombs: 4, rupoors: 0 },
+      intermediate: { w: 6, h: 5, bombs: 4, rupoors: 4 },
+      expert:       { w: 8, h: 5, bombs: 8, rupoors: 8 },
+    };
+
+    // User-entered cell states (this app doesn't simulate the hidden board).
+    const State = Object.freeze({
+      UNKNOWN: 0,
+      GREEN: 1,   // clue: 0 adjacent bad
+      BLUE: 2,    // clue: 1-2 adjacent bad
+      RED: 3,     // clue: 3-4 adjacent bad
+      SILVER: 4,  // clue: 5-6 adjacent bad
+      GOLD: 5,    // clue: 7-8 adjacent bad
+      RUPOOR: 6,  // bad
+      BOMB: 7     // bad
+    });
+
+    const cycleOrder = [
+      State.UNKNOWN, State.GREEN, State.BLUE, State.RED, State.SILVER, State.GOLD, State.RUPOOR, State.BOMB
+    ];
+
+    function stateLabel(s) {
+      switch (s) {
+        case State.UNKNOWN: return "?";
+        case State.GREEN: return "G";
+        case State.BLUE: return "B";
+        case State.RED: return "R";
+        case State.SILVER: return "S";
+        case State.GOLD: return "★";
+        case State.RUPOOR: return "Ø";
+        case State.BOMB: return "💣";
+        default: return "?";
+      }
+    }
+
+    // clue ranges for adjacent (bomb OR rupoor) counts.
+    function clueRangeForState(s) {
+      switch (s) {
+        case State.GREEN: return [0, 0];
+        case State.BLUE: return [1, 2];
+        case State.RED: return [3, 4];
+        case State.SILVER: return [5, 6];
+        case State.GOLD: return [7, 8];
+        default: return null;
+      }
+    }
+
+    function isBad(s) { return s === State.RUPOOR || s === State.BOMB; }
+    function isSafeRevealed(s) { return s >= State.GREEN && s <= State.GOLD; }
+
+    // --- UI / Board ---
+    const elBoard = document.getElementById("board");
+    const elStatus = document.getElementById("status");
+    const elDiff = document.getElementById("difficulty");
+
+    let W = 5, H = 4, TOTAL_BAD = 4;
+    let cells = [];
+    let probs = [];
+    let bestIdxs = new Set();
+    let worstIdxs = new Set();
+
+    function idx(x, y) { return y * W + x; }
+    function inBounds(x, y) { return x >= 0 && x < W && y >= 0 && y < H; }
+
+    function neighbors(i) {
+      const x = i % W, y = (i / W) | 0;
+      const out = [];
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        if (dx === 0 && dy === 0) continue;
+        const nx = x + dx, ny = y + dy;
+        if (inBounds(nx, ny)) out.push(idx(nx, ny));
+      }
+      return out;
+    }
+
+    function newBoard() {
+      const d = DIFF[elDiff.value];
+      W = d.w; H = d.h; TOTAL_BAD = d.bombs + d.rupoors;
+      cells = new Array(W * H).fill(State.UNKNOWN);
+      probs = new Array(W * H).fill(null);
+      bestIdxs.clear(); worstIdxs.clear();
+      render();
+      setStatus("Enter what you reveal in-game, then click Solve.");
+    }
+
+    function clearHighlights() {
+      bestIdxs.clear(); worstIdxs.clear();
+      render();
+    }
+
+    function setStatus(msg) {
+      const knownBad = cells.filter(isBad).length;
+      const unknown = cells.filter(s => s === State.UNKNOWN).length;
+      const knownSafe = cells.filter(isSafeRevealed).length;
+      const remainingBad = Math.max(0, TOTAL_BAD - knownBad);
+
+      elStatus.innerHTML = [
+        `Board: ${W}×${H}`,
+        `Total bad spots (bombs+rupoors): ${TOTAL_BAD}`,
+        `Known bad: ${knownBad}`,
+        `Known safe (rupees): ${knownSafe}`,
+        `Unknown: ${unknown}`,
+        `Remaining bad (implied): ${remainingBad}`,
+        "",
+        msg
+      ].join("<br/>");
+    }
+
+    function render() {
+      elBoard.innerHTML = "";
+      const table = document.createElement("table");
+      table.className = "grid";
+
+      for (let y = 0; y < H; y++) {
+        const tr = document.createElement("tr");
+        for (let x = 0; x < W; x++) {
+          const td = document.createElement("td");
+          const i = idx(x, y);
+
+          const b = document.createElement("button");
+          b.className = "cell";
+          const s = cells[i];
+          b.textContent = stateLabel(s);
+
+          if (bestIdxs.has(i)) b.classList.add("safePick");
+          if (worstIdxs.has(i)) b.classList.add("risky");
+
+          const p = probs[i];
+          if (s === State.UNKNOWN && typeof p === "number") {
+            b.title = `Bad chance: ${(p * 100).toFixed(2)}%`;
+          } else if (isBad(s)) {
+            b.title = `Known bad`;
+          } else if (isSafeRevealed(s)) {
+            const r = clueRangeForState(s);
+            b.title = `Clue: adjacent bad spots = ${r[0]}..${r[1]}`;
+          } else {
+            b.title = "";
+          }
+
+          b.addEventListener("click", () => {
+            const cur = cells[i];
+            const pos = cycleOrder.indexOf(cur);
+            const next = cycleOrder[(pos + 1) % cycleOrder.length];
+            cells[i] = next;
+            probs[i] = null;
+            bestIdxs.clear(); worstIdxs.clear();
+            render();
+            setStatus("Updated cell. Click Solve or Best move.");
+          });
+
+          td.appendChild(b);
+          tr.appendChild(td);
+        }
+        table.appendChild(tr);
+      }
+
+      elBoard.appendChild(table);
+    }
+
+    // --- Solver core (exact enumeration on frontier + combinations for free cells) ---
+    function solve() {
+      bestIdxs.clear();
+      worstIdxs.clear();
+
+      const N = W * H;
+      const unknowns = [];
+      const knownBadSet = new Set();
+      const knownSafeClues = [];
+      for (let i = 0; i < N; i++) {
+        if (cells[i] === State.UNKNOWN) unknowns.push(i);
+        if (isBad(cells[i])) knownBadSet.add(i);
+        if (isSafeRevealed(cells[i])) knownSafeClues.push(i);
+      }
+
+      const knownBad = knownBadSet.size;
+      const remainingBadTotal = TOTAL_BAD - knownBad;
+
+      if (remainingBadTotal < 0) {
+        setStatus(`<span class="warn">Inconsistent: you marked more bad spots than the mode contains.</span>`);
+        probs.fill(null); render();
+        return { ok: false };
+      }
+      if (remainingBadTotal > unknowns.length) {
+        setStatus(`<span class="warn">Inconsistent: not enough unknown cells to hold remaining bad spots.</span>`);
+        probs.fill(null); render();
+        return { ok: false };
+      }
+
+      const constraints = [];
+      for (const c of knownSafeClues) {
+        const range = clueRangeForState(cells[c]);
+        if (!range) continue;
+        const neigh = neighbors(c);
+
+        let fixedBad = 0;
+        const vars = [];
+        for (const j of neigh) {
+          if (knownBadSet.has(j)) fixedBad++;
+          else if (cells[j] === State.UNKNOWN) vars.push(j);
+        }
+
+        let lo = range[0] - fixedBad;
+        let hi = range[1] - fixedBad;
+
+        if (lo < 0) lo = 0;
+        if (hi < 0) hi = -1;
+        if (hi > vars.length) hi = vars.length;
+
+        constraints.push({ vars, lo, hi });
+      }
+
+      for (const con of constraints) {
+        if (con.lo > con.hi) {
+          setStatus(`<span class="warn">Inconsistent clues: a rupee implies an impossible neighbor bad-range.</span>`);
+          probs.fill(null); render();
+          return { ok: false };
+        }
+      }
+
+      const frontierSet = new Set();
+      for (const con of constraints) for (const v of con.vars) frontierSet.add(v);
+      const frontier = Array.from(frontierSet);
+      const frontierIndex = new Map(frontier.map((v, k) => [v, k]));
+      const F = frontier.length;
+
+      const free = unknowns.filter(i => !frontierSet.has(i));
+      const FREE = free.length;
+
+      const cons = constraints
+        .map(con => ({
+          vars: con.vars.map(v => frontierIndex.get(v)).filter(v => v !== undefined),
+          lo: con.lo,
+          hi: con.hi
+        }))
+        .filter(con => con.vars.length > 0);
+
+      // Precompute combinations
+      const maxN = 50;
+      const C = Array.from({length: maxN+1}, () => new Array(maxN+1).fill(0));
+      for (let n = 0; n <= maxN; n++) {
+        C[n][0] = 1;
+        C[n][n] = 1;
+        for (let k = 1; k < n; k++) C[n][k] = C[n-1][k-1] + C[n-1][k];
+      }
+      function nCr(n, k) {
+        if (k < 0 || k > n) return 0;
+        return C[n][k];
+      }
+
+      probs = new Array(N).fill(null);
+
+      // No constraints => uniform probability
+      if (cons.length === 0 || F === 0) {
+        const p = unknowns.length ? (remainingBadTotal / unknowns.length) : 0;
+        for (const u of unknowns) probs[u] = p;
+        pickHighlights(unknowns);
+        render();
+        setStatus(`No clue constraints yet. Uniform bad chance = ${(p*100).toFixed(2)}%.`);
+        return { ok: true, totalWeight: 1 };
+      }
+
+      const conAssignedBad = new Array(cons.length).fill(0);
+      const conAssignedVars = new Array(cons.length).fill(0);
+
+      const affects = Array.from({length: F}, () => []);
+      for (let ci = 0; ci < cons.length; ci++) {
+        for (const v of cons[ci].vars) affects[v].push(ci);
+      }
+
+      const order = [...Array(F).keys()].sort((a,b) => affects[b].length - affects[a].length);
+      const assign = new Array(F).fill(-1);
+
+      let totalWeight = 0;
+      const badWeightPerVar = new Array(F).fill(0);
+      let assignedBadTotal = 0;
+
+      function constraintPossible(ci) {
+        const con = cons[ci];
+        const assignedVars = conAssignedVars[ci];
+        const assignedBad = conAssignedBad[ci];
+        const unassigned = con.vars.length - assignedVars;
+
+        const minPossible = assignedBad;
+        const maxPossible = assignedBad + unassigned;
+
+        if (maxPossible < con.lo) return false;
+        if (minPossible > con.hi) return false;
+        return true;
+      }
+
+      function allConstraintsPossibleForVar(vIdx) {
+        for (const ci of affects[vIdx]) {
+          if (!constraintPossible(ci)) return false;
+        }
+        return true;
+      }
+
+      function isFullySatisfied() {
+        for (let ci = 0; ci < cons.length; ci++) {
+          const con = cons[ci];
+          if (conAssignedVars[ci] !== con.vars.length) return false;
+          const b = conAssignedBad[ci];
+          if (b < con.lo || b > con.hi) return false;
+        }
+        return true;
+      }
+
+      function backtrack(pos) {
+        if (pos === F) {
+          if (!isFullySatisfied()) return;
+
+          const remainingBadForFree = remainingBadTotal - assignedBadTotal;
+          if (remainingBadForFree < 0 || remainingBadForFree > FREE) return;
+
+          const weight = nCr(FREE, remainingBadForFree);
+          totalWeight += weight;
+
+          for (let v = 0; v < F; v++) if (assign[v] === 1) badWeightPerVar[v] += weight;
+          return;
+        }
+
+        const v = order[pos];
+
+        // try safe
+        assign[v] = 0;
+        for (const ci of affects[v]) conAssignedVars[ci] += 1;
+        if (allConstraintsPossibleForVar(v)) backtrack(pos + 1);
+        for (const ci of affects[v]) conAssignedVars[ci] -= 1;
+
+        // try bad
+        assign[v] = 1;
+        assignedBadTotal += 1;
+        for (const ci of affects[v]) { conAssignedVars[ci] += 1; conAssignedBad[ci] += 1; }
+
+        const remainingVars = F - (pos + 1);
+        const minBadPossible = assignedBadTotal;
+        const maxBadPossible = assignedBadTotal + remainingVars;
+        const okTotal =
+          (minBadPossible <= remainingBadTotal) &&
+          (maxBadPossible >= remainingBadTotal - FREE);
+
+        if (okTotal && allConstraintsPossibleForVar(v)) backtrack(pos + 1);
+
+        for (const ci of affects[v]) { conAssignedVars[ci] -= 1; conAssignedBad[ci] -= 1; }
+        assignedBadTotal -= 1;
+        assign[v] = -1;
+      }
+
+      backtrack(0);
+
+      if (totalWeight === 0) {
+        setStatus(`<span class="warn">No configurations satisfy the clues you entered (inconsistent input).</span>`);
+        probs.fill(null);
+        render();
+        return { ok: false };
+      }
+
+      // frontier probs
+      for (let k = 0; k < F; k++) {
+        const cellIdx = frontier[k];
+        probs[cellIdx] = badWeightPerVar[k] / totalWeight;
+      }
+
+      // exact marginal for free cells: E[remainingBadForFree/FREE]
+      let expectedFreeBadNumerator = 0;
+
+      conAssignedBad.fill(0);
+      conAssignedVars.fill(0);
+      assignedBadTotal = 0;
+      assign.fill(-1);
+
+      function backtrackForFreeExpectation(pos) {
+        if (pos === F) {
+          if (!isFullySatisfied()) return;
+          const remainingBadForFree = remainingBadTotal - assignedBadTotal;
+          if (remainingBadForFree < 0 || remainingBadForFree > FREE) return;
+          const weight = nCr(FREE, remainingBadForFree);
+          expectedFreeBadNumerator += weight * remainingBadForFree;
+          return;
+        }
+
+        const v = order[pos];
+
+        // safe
+        assign[v] = 0;
+        for (const ci of affects[v]) conAssignedVars[ci] += 1;
+        if (allConstraintsPossibleForVar(v)) backtrackForFreeExpectation(pos + 1);
+        for (const ci of affects[v]) conAssignedVars[ci] -= 1;
+
+        // bad
+        assign[v] = 1;
+        assignedBadTotal += 1;
+        for (const ci of affects[v]) { conAssignedVars[ci] += 1; conAssignedBad[ci] += 1; }
+
+        const remainingVars = F - (pos + 1);
+        const minBadPossible = assignedBadTotal;
+        const maxBadPossible = assignedBadTotal + remainingVars;
+        const okTotal =
+          (minBadPossible <= remainingBadTotal) &&
+          (maxBadPossible >= remainingBadTotal - FREE);
+
+        if (okTotal && allConstraintsPossibleForVar(v)) backtrackForFreeExpectation(pos + 1);
+
+        for (const ci of affects[v]) { conAssignedVars[ci] -= 1; conAssignedBad[ci] -= 1; }
+        assignedBadTotal -= 1;
+        assign[v] = -1;
+      }
+
+      backtrackForFreeExpectation(0);
+
+      const freeCellBadProb = (FREE > 0) ? (expectedFreeBadNumerator / (totalWeight * FREE)) : null;
+      if (FREE > 0 && typeof freeCellBadProb === "number") {
+        for (const u of free) probs[u] = freeCellBadProb;
+      }
+
+      // Known cells: no probability
+      for (let i = 0; i < N; i++) {
+        if (cells[i] !== State.UNKNOWN) probs[i] = null;
+      }
+
+      pickHighlights(unknowns);
+      render();
+
+      setStatus(
+        `Solved: ${totalWeight} consistent configurations. ` +
+        (FREE > 0 ? `Unconstrained cells bad chance ${(freeCellBadProb*100).toFixed(2)}%. ` : "") +
+        `Safest/riskiest highlighted.`
+      );
+
+      return { ok: true, totalWeight };
+    }
+
+    function pickHighlights(unknowns) {
+      let minP = Infinity, maxP = -Infinity;
+      for (const u of unknowns) {
+        const p = probs[u];
+        if (typeof p !== "number") continue;
+        if (p < minP) minP = p;
+        if (p > maxP) maxP = p;
+      }
+      if (!isFinite(minP)) return;
+
+      for (const u of unknowns) {
+        const p = probs[u];
+        if (typeof p !== "number") continue;
+        if (Math.abs(p - minP) < 1e-12) bestIdxs.add(u);
+        if (Math.abs(p - maxP) < 1e-12) worstIdxs.add(u);
+      }
+    }
+
+    // --- Best Move (single pick) ---
+    // Primary: minimize P(bad)
+    // Tie-break: maximize "info gain" (adjacent unknowns, plus adjacency to existing clue cells)
+    function bestMove() {
+      const result = solve();
+      if (!result || !result.ok) return;
+
+      const N = W * H;
+      const unknowns = [];
+      for (let i = 0; i < N; i++) if (cells[i] === State.UNKNOWN) unknowns.push(i);
+      if (unknowns.length === 0) {
+        setStatus("No unknown cells left.");
+        return;
+      }
+
+      let anyProb = false;
+      for (const u of unknowns) {
+        if (typeof probs[u] === "number") { anyProb = true; break; }
+      }
+      if (!anyProb) {
+        setStatus("Cannot suggest a best move because probabilities are unavailable (check for inconsistent input).");
+        return;
+      }
+
+      let best = null;
+
+      for (const u of unknowns) {
+        const pBad = probs[u];
+        if (typeof pBad !== "number") continue;
+
+        const neigh = neighbors(u);
+        const adjUnknown = neigh.reduce((acc, j) => acc + (cells[j] === State.UNKNOWN ? 1 : 0), 0);
+        const adjClues = neigh.reduce((acc, j) => acc + (isSafeRevealed(cells[j]) ? 1 : 0), 0);
+
+        const candidate = {
+          idx: u,
+          pBad,
+          info: adjUnknown * 2 + adjClues
+        };
+
+        if (!best) best = candidate;
+        else {
+          if (candidate.pBad < best.pBad - 1e-12) best = candidate;
+          else if (Math.abs(candidate.pBad - best.pBad) < 1e-12 && candidate.info > best.info) best = candidate;
+        }
+      }
+
+      if (!best) {
+        setStatus("No valid best move found.");
+        return;
+      }
+
+      // highlight only the single best move
+      bestIdxs.clear();
+      worstIdxs.clear();
+      bestIdxs.add(best.idx);
+      render();
+
+      const x = best.idx % W;
+      const y = (best.idx / W) | 0;
+
+      setStatus(
+        `Best move: (${x}, ${y}) ` +
+        `Bad chance ${(best.pBad * 100).toFixed(2)}%, ` +
+        `Info score ${best.info}. Click the green-outlined cell.`
+      );
+    }
+
+    // --- wire up ---
+    document.getElementById("newGame").addEventListener("click", newBoard);
+    document.getElementById("solve").addEventListener("click", solve);
+    document.getElementById("bestMove").addEventListener("click", bestMove);
+    document.getElementById("clearHighlights").addEventListener("click", clearHighlights);
+    elDiff.addEventListener("change", newBoard);
+
+    // init
+    newBoard();
+  </script>
+
+  <div class="panel small">
+    <b>Legend</b>:
+    <span class="mono">?</span> unknown,
+    <span class="mono">G</span> green rupee,
+    <span class="mono">B</span> blue,
+    <span class="mono">R</span> red,
+    <span class="mono">S</span> silver,
+    <span class="mono">★</span> gold,
+    <span class="mono">Ø</span> rupoor,
+    <span class="mono">💣</span> bomb.
+  </div>
+</body>
+</html>
